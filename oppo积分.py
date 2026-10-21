@@ -67,6 +67,11 @@ SPECIAL_ACTIVITY_IDS = {
 # 可以在这里添加、修改或禁用特定的活动
 # enabled: False 表示禁用该活动
 # is_lucky_draw: 控制该活动是否抽奖（可选，不设置时使用默认值）
+# bp_url 支持两种形态：
+#   1. 字符串：活动页面路径，如 "/bp/747f65c18da6f6b7"
+#   2. dict {"url": ..., "activity_area": ..., "activity_name": ...}：
+#      去 advert/300003 按「栏目标题 + 详情标题」动态解析真实入口路径，
+#      适合入口每天变形的活动；解析失败会跳过该活动并记入日志
 STATIC_ACTIVITIES_CONFIG = [
     {"bp_url": "/bp/747f65c18da6f6b7", "name": "积分兑换专区", "enabled": True, "draw_jimu_name": "OPPO 商城 积分兑换专区"},
     {"bp_url": "/bp/457871c72cb6ccd9", "name": "莎莎企业", "enabled": True, "draw_jimu_name": "莎莎企业 夏日奇旅"},
@@ -666,10 +671,55 @@ class OppoApp:
             log_print(f"❌ 领取任务【{task_name}】奖励时出错: {e}")
             return None
 
+    def _get_sku_ids(self):
+        """从 advert/220031 拉商品楼层，提取 skuId 列表（兼容 link 参数 / hotZone / goodsForm 三种形态）。"""
+        response = self.client.get(f"{BASE_URL_MSEC}/configs/web/advert/220031")
+        response.raise_for_status()
+        config_data = response.json()
+        sku_ids = set()
+        for module in config_data.get('data', []):
+            for detail in module.get('details', []):
+                link = detail.get('link', '') or ''
+                if 'skuId=' in link:
+                    query_params = parse_qs(urlparse(link).query)
+                    sku_id = query_params.get("skuId", [None])[0]
+                    if sku_id:
+                        sku_ids.add(int(sku_id))
+                hot_zone = detail.get("hotZone", {})
+                for subscribe in hot_zone.get("hotZoneSubscribe", []):
+                    sku_id = subscribe.get("skuId")
+                    if sku_id:
+                        sku_ids.add(int(sku_id))
+                goods_form = detail.get('goodsForm', {})
+                sku_id = goods_form.get('skuId')
+                if sku_id:
+                    sku_ids.add(int(sku_id))
+        return list(sku_ids)
+
     def _browse_products(self, num_to_browse):
-        """模拟浏览商品。"""
-        log_print(f"ℹ️ 需要浏览 {num_to_browse} 个商品...")
-        log_print(f"✅ 已模拟浏览 {num_to_browse} 个商品。")
+        """真浏览商品：拉 sku 列表后逐个请求详情页（移植自仓库版 get_sku_ids + browse_products）。
+        浏览失败不计入失败汇总——服务端完成任务只认 signInOrShareTask 上报，这里尽力而为。"""
+        try:
+            sku_ids = self._get_sku_ids()
+        except Exception as e:
+            log_print(f"⚠️ 获取商品 sku 列表失败，跳过浏览: {e}")
+            return
+        if not sku_ids:
+            log_print("⚠️ 商品楼层未解析到任何 skuId，跳过浏览。")
+            return
+
+        random.shuffle(sku_ids)
+        browsed = 0
+        for sku_id in sku_ids[:num_to_browse]:
+            try:
+                self.client.get(
+                    f"{BASE_URL_MSEC}/cms-business/goods/detail?interfaceVersion=v2&pageCode=skuDetail&modelCode=OnePlus%20PJZ110&skuId={sku_id}"
+                )
+                browsed += 1
+                random_sleep(0.5, 1.5)
+            except Exception as e:
+                log_print(f"⚠️ 浏览商品 skuId={sku_id} 失败: {e}")
+        log_print(f"👀 已浏览 {browsed}/{num_to_browse} 个商品（共拉到 {len(sku_ids)} 个 sku）。")
 
     def run(self):
         """执行APP版所有任务的入口函数。"""
@@ -790,46 +840,65 @@ class ActivityHandler:
     def __init__(self, client: httpx.Client):
         self.client = client
 
+    def _find_activity_link(self, area_keyword, name_keyword):
+        """在 advert/300003 里按「栏目标题 + 详情标题」查找活动入口链接，返回原始 link 或 None。"""
+        response = self.client.get(f"{BASE_URL_MSEC}/configs/web/advert/300003")
+        response.raise_for_status()
+        data = response.json()
+        if data.get('code') != 200:
+            raise ApiError(f"接口返回 code={data.get('code')}，message={data.get('message')}")
+        for section in data.get('data', []):
+            if area_keyword in section.get("title", ""):
+                for detail in section.get('details', []):
+                    if name_keyword in detail.get('title', ""):
+                        return detail.get('link')
+        return None
+
     def _discover_dynamic_activities(self):
         """动态发现活动入口。"""
         discovered_activities = []
         try:
-            response = self.client.get(f"{BASE_URL_MSEC}/configs/web/advert/300003")
-            response.raise_for_status()
-            data = response.json()
-            if data.get('code') != 200:
-                log_print(f"❌ 动态发现活动失败：{data.get('message')}")
-                return []
-
             for item_to_find in DYNAMIC_ACTIVITIES_TO_FIND:
-                found = False
-                for section in data.get('data', []):
-                    if item_to_find['keyword1'] in section.get("title", ""):
-                        for detail in section.get('details', []):
-                            if item_to_find['keyword2'] in detail.get('title', ""):
-                                link = detail.get('link')
-                                if link:
-                                    bp_url = urlparse(link).path
-                                    activity_config = {
-                                        "bp_url": bp_url,
-                                        "name": item_to_find['name'],
-                                        "enabled": True,
-                                        "draw_jimu_name": item_to_find['draw_jimu_name']
-                                    }
-                                    # 如果动态活动配置中有 is_lucky_draw，传递给发现的活动
-                                    if 'is_lucky_draw' in item_to_find:
-                                        activity_config['is_lucky_draw'] = item_to_find['is_lucky_draw']
-                                    discovered_activities.append(activity_config)
-                                    log_print(f"🔍 动态发现活动【{item_to_find['name']}】, URL: {bp_url}")
-                                    found = True
-                                    break
-                    if found:
-                        break
-                if not found:
+                link = self._find_activity_link(item_to_find['keyword1'], item_to_find['keyword2'])
+                if link:
+                    bp_url = urlparse(link).path
+                    activity_config = {
+                        "bp_url": bp_url,
+                        "name": item_to_find['name'],
+                        "enabled": True,
+                        "draw_jimu_name": item_to_find['draw_jimu_name']
+                    }
+                    # 如果动态活动配置中有 is_lucky_draw，传递给发现的活动
+                    if 'is_lucky_draw' in item_to_find:
+                        activity_config['is_lucky_draw'] = item_to_find['is_lucky_draw']
+                    discovered_activities.append(activity_config)
+                    log_print(f"🔍 动态发现活动【{item_to_find['name']}】, URL: {bp_url}")
+                else:
                     log_print(f"⚠️ 未能动态发现活动【{item_to_find['name']}】")
         except Exception as e:
             log_print(f"❌ 动态发现活动时发生异常: {e}")
         return discovered_activities
+
+    def _resolve_bp_url(self, bp_url):
+        """bp_url 兼容两种形态（移植自仓库版 BaseActivity.get_activity_url）：
+        - 字符串：页面路径，原样返回；
+        - dict {url, activity_area, activity_name}：去 advert/300003 按「栏目 + 标题」
+          解析真实入口路径——用于每天变形的「福利专区 / 签到」类活动入口。
+        解析失败返回 None。"""
+        if not isinstance(bp_url, dict):
+            return bp_url
+        try:
+            link = self._find_activity_link(bp_url['activity_area'], bp_url['activity_name'])
+            if link:
+                path = urlparse(link).path
+                log_print(f"🔍 动态解析活动入口 [{bp_url['activity_area']} / {bp_url['activity_name']}] → {path}")
+                return path
+            log_print(f"❌ 未能按 [{bp_url['activity_area']} / {bp_url['activity_name']}] 解析出活动入口。")
+        except KeyError as e:
+            log_print(f"❌ bp_url 字典缺少必需键 {e}，应为 {{url, activity_area, activity_name}}。")
+        except Exception as e:
+            log_print(f"❌ 动态解析活动入口时发生异常: {e}")
+        return None
 
     def _get_activity_ids(self, bp_url):
         """通用方法：从任何活动页面解析所需的各种ID。"""
@@ -1693,7 +1762,8 @@ class ActivityHandler:
             log_print(f"\n####### ▶️ 开始执行【{activity['name']}】 #######")
             notify_manager.add_summary(f"  📌 活动: {activity['name']}")
 
-            ids = self._get_activity_ids(activity['bp_url'])
+            bp_url = self._resolve_bp_url(activity['bp_url'])
+            ids = self._get_activity_ids(bp_url) if bp_url else None
 
             if not ids:
                 log_print(f"❌ 未能获取【{activity['name']}】的活动ID，跳过此活动。")
