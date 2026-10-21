@@ -25,10 +25,12 @@ OPPO 商城 APP 和 小程序 签到任务自动化脚本。
 
 失败处理：
 - 任何接口失败（HTTP 错误、业务 code 非 200、返回内容不是合法 JSON）都会明确报错，
-  不再静默跳过；
+ 不再静默跳过；
 - Cookie 过期/无效、账号配置格式错误、会员等级非法记为「致命失败」，该账号立即中止；
-- 脚本结束时打印失败汇总，并以退出码 1 结束（青龙等平台会把本次任务标记为失败），
-  只有全部成功才返回 0。
+- 签到/任务/领奖/抽奖等任务项失败只记录报错，不计为致命：任务项失败过半
+ （失败数 * 2 >= 尝试数）才按致命处理；少于一半则退出码 0、不推送告警，
+ 失败明细仍打印在日志和 stderr 汇总里；
+- 存在致命失败或任务项失败过半时，以退出码 1 结束（青龙等平台会把本次任务标记为失败）。
 
 青龙推送（失败告警）：
 - 有失败时调用青龙面板 API 推送通知，走面板里已配置的通知渠道 / Webhook；
@@ -121,21 +123,45 @@ class CookieExpired(ApiError):
 
 class FailureManager:
     """
-    收集所有失败项，脚本结束时统一汇报，并以非零退出码结束。
+    收集所有失败项，脚本结束时统一汇报。
 
     失败分两级：
     - 普通失败：单个任务/活动/接口出错，其余流程继续；
     - 致命失败：Cookie 失效、账号配置错误等，该账号后续流程中止。
+
+    退出码 / 告警规则：
+    - 存在致命失败（Cookie/403/配置错误）→ 退出码 1，推送告警；
+    - 任务项失败过半（失败数 * 2 >= 尝试数）→ 视为致命，退出码 1，推送告警；
+    - 少于一半任务失败 → 退出码 0，不推送，只在日志和 stderr 汇总中报错。
     """
 
     def __init__(self):
         self.scope = "全局"
         self.failures = []
         self.fatal_failures = []
+        self.task_total = 0    # 尝试过的任务项总数（签到/任务/领奖/抽奖/活动ID解析）
+        self.task_failed = 0   # 其中失败的任务项数
+        self._current_task_failed = False
 
     def set_scope(self, scope):
         """设置当前失败项的归属（账号/活动），后续记录会自动带上。"""
         self.scope = scope
+
+    def begin_task(self):
+        """开始统计一个任务项。同一项内多次报错只计一次失败。"""
+        self.task_total += 1
+        self._current_task_failed = False
+
+    def add_task_failure(self, message, fatal=False, scope=None):
+        """记录一个任务项的失败，并计入失败率统计。"""
+        self.add(message, fatal=fatal, scope=scope)
+        if not self._current_task_failed:
+            self._current_task_failed = True
+            self.task_failed += 1
+
+    def task_majority_failed(self):
+        """任务项失败是否过半。没有统计到任何任务项时不算过半。"""
+        return self.task_total > 0 and self.task_failed * 2 >= self.task_total
 
     def add(self, message, fatal=False, scope=None):
         """记录一条失败。同一项若先记为普通失败、后判定为致命，会自动升级。"""
@@ -159,20 +185,27 @@ class FailureManager:
             return ""
         total = len(self.fatal_failures) + len(self.failures)
         lines = [f"共 {total} 项失败（致命 {len(self.fatal_failures)} 项）"]
+        if self.task_total:
+            ratio = f"{self.task_failed}/{self.task_total}"
+            lines.append(f"任务失败率: {ratio}" + ("（已过半）" if self.task_majority_failed() else "（未过半，仅记录不告警）"))
         for i, item in enumerate(self.fatal_failures + self.failures, 1):
             lines.append(f"{i}. {item}")
         if self.fatal_failures:
             lines.append("⚠️ 存在致命失败（多为 Cookie 过期或配置错误），请先处理后重跑。")
+        elif self.task_majority_failed():
+            lines.append("⚠️ 任务失败已过半，本次按致命失败处理。")
         return "\n".join(lines)
 
     def report(self):
-        """打印失败汇总（输出到 stderr），返回退出码：0 表示全部成功。"""
+        """打印失败汇总（输出到 stderr）。退出码：致命失败或任务失败过半 → 1，否则 0。"""
         if not self.has_failure():
             return 0
         body = self.summary_text()
         print("\n=============== ❌ 执行失败汇总 ===============\n"
               + body + "\n=============================================", file=sys.stderr)
-        return 1
+        if self.fatal_failures or self.task_majority_failed():
+            return 1
+        return 0
 
 
 # 全局失败收集器实例
@@ -290,11 +323,13 @@ class StrictClient(httpx.Client):
         return response
 
 
-def log_print(*args, sep=' ', end='\n', fail=None, **kwargs):
+def log_print(*args, sep=' ', end='\n', fail=None, task=False, **kwargs):
     """
     自定义的日志打印函数，输出到控制台，同时把失败日志自动收进失败汇总。
 
     :param fail: None 表示按前缀自动判断（❌ / 🚨 视为失败），True/False 可强制指定。
+    :param task: True 表示这是任务项（签到/任务/领奖/抽奖）内的失败，
+                 计入「任务失败率」，过半才会让整轮退出码变 1。
     """
     message = sep.join(str(a) for a in args)
     print(message, sep='', end=end, **kwargs)
@@ -304,7 +339,10 @@ def log_print(*args, sep=' ', end='\n', fail=None, **kwargs):
     if fail:
         # Cookie 失效 / 403 属于致命失败，需要重新抓包才能继续
         fatal = '403' in message or ('Cookie' in message and ('过期' in message or '无效' in message))
-        failure_manager.add(message, fatal=fatal)
+        if task:
+            failure_manager.add_task_failure(message, fatal=fatal)
+        else:
+            failure_manager.add(message, fatal=fatal)
 
 def get_env(env_var, separator):
     """
@@ -442,6 +480,7 @@ class OppoApp:
         """
         从活动页面HTML中解析出任务活动ID和签到活动ID。
         """
+        failure_manager.begin_task()
         try:
             response = self.client.get("/bp/b371ce270f7509f0")
             response.raise_for_status()
@@ -449,7 +488,7 @@ class OppoApp:
             match = re.search(r'window\.__DSL__\s*=\s*({.*?});', html, re.DOTALL)
 
             if not match:
-                log_print("❌ 未能从APP活动页解析出活动ID，页面结构可能已更新。")
+                log_print("❌ 未能从APP活动页解析出活动ID，页面结构可能已更新。", task=True)
                 return
 
             dsl_json = json.loads(match.group(1))
@@ -462,7 +501,7 @@ class OppoApp:
                 if "Task" in cmp: task_field = cmp
 
             if not task_field:
-                log_print("❌ 未在页面数据中找到任务组件ID。")
+                log_print("❌ 未在页面数据中找到任务组件ID。", task=True)
                 return
 
             self.activity_id = dsl_json['byId'][task_field]['attr']['taskActivityInfo']['activityId']
@@ -474,10 +513,10 @@ class OppoApp:
                     break
 
             if not self.sign_in_map:
-                log_print(f"❌ 未找到与会员等级'{self.level}'匹配的签到活动ID。")
+                log_print(f"❌ 未找到与会员等级'{self.level}'匹配的签到活动ID。", task=True)
 
         except Exception as e:
-            log_print(f"❌ 获取APP活动ID时出错: {e}")
+            log_print(f"❌ 获取APP活动ID时出错: {e}", task=True)
 
     def sign_in(self):
         """执行每日签到。"""
@@ -486,6 +525,7 @@ class OppoApp:
             log_print("⏭️ 因缺少签到活动ID，跳过APP签到。")
             return
 
+        failure_manager.begin_task()
         try:
             detail_res = self.client.get(f"/api/cn/oapi/marketing/cumulativeSignIn/getSignInDetail?activityId={activity_id}").json()
             if detail_res.get('data', {}).get('todaySignIn'):
@@ -504,10 +544,10 @@ class OppoApp:
                 notify_manager.add_summary(f"✅ 签到: 成功 (积分 +{award_value})")
             else:
                 reason = data.get('message', '未知错误')
-                log_print(f"❌ 签到失败！原因: {reason}")
+                log_print(f"❌ 签到失败！原因: {reason}", task=True)
                 notify_manager.add_summary(f"❌ 签到: 失败 - {reason}")
         except Exception as e:
-            log_print(f"❌ 签到时发生异常: {e}")
+            log_print(f"❌ 签到时发生异常: {e}", task=True)
             notify_manager.add_summary("❌ 签到: 执行异常")
 
     def do_tasks(self):
@@ -565,6 +605,7 @@ class OppoApp:
                     continue
 
                 log_print(f"--- ▶️ 开始做APP任务:【{task_name}】 ---")
+                failure_manager.begin_task()
 
                 try:
                     # 特殊处理某些任务类型：只在状态2时执行，状态1时跳过
@@ -618,10 +659,11 @@ class OppoApp:
                     random_sleep()
                 except Exception as e:
                     error_count += 1
-                    log_print(f"❌ 执行任务【{task_name}】过程中出错: {e}")
+                    log_print(f"❌ 执行任务【{task_name}】过程中出错: {e}", task=True)
 
         except Exception as e:
-            log_print(f"❌ 获取任务列表时出错: {e}")
+            failure_manager.begin_task()
+            log_print(f"❌ 获取任务列表时出错: {e}", task=True)
             notify_manager.add_summary("❌ 任务: 获取列表失败")
             return
 
@@ -649,9 +691,9 @@ class OppoApp:
             if data.get('data'):
                 log_print(f"✔️ 任务【{task_name}】完成！")
             else:
-                log_print(f"❌ 任务【{task_name}】完成失败！-> {data.get('message')}")
+                log_print(f"❌ 任务【{task_name}】完成失败！-> {data.get('message')}", task=True)
         except Exception as e:
-            log_print(f"❌ 完成任务【{task_name}】时出错: {e}")
+            log_print(f"❌ 完成任务【{task_name}】时出错: {e}", task=True)
             raise
 
     def _receive_reward(self, task_name, task_id, activity_id):
@@ -665,10 +707,10 @@ class OppoApp:
                 log_print(f"💰 任务【{task_name}】奖励领取成功！积分 +{points}")
                 return points
             else:
-                log_print(f"❌ 任务【{task_name}】奖励领取失败 -> {data.get('message')}")
+                log_print(f"❌ 任务【{task_name}】奖励领取失败 -> {data.get('message')}", task=True)
                 return None
         except Exception as e:
-            log_print(f"❌ 领取任务【{task_name}】奖励时出错: {e}")
+            log_print(f"❌ 领取任务【{task_name}】奖励时出错: {e}", task=True)
             return None
 
     def _get_sku_ids(self):
@@ -956,6 +998,7 @@ class ActivityHandler:
 
     def _handle_sign_in(self, signin_id):
         """处理单个活动的签到和累计奖励领取。"""
+        failure_manager.begin_task()
         try:
             detail_res = self.client.get(f"{BASE_URL_HD}/api/cn/oapi/marketing/cumulativeSignIn/getSignInDetail?activityId={signin_id}").json()
             if detail_res.get('data', {}).get('todaySignIn'):
@@ -969,10 +1012,10 @@ class ActivityHandler:
                     log_print(f"✅ 签到成功！获得积分：{award_val}")
                     notify_manager.add_summary(f"    ✅ 签到: 成功 (积分 +{award_val})")
                 else:
-                    log_print(f"❌ 签到失败！原因: {data.get('message', '未知错误')}")
+                    log_print(f"❌ 签到失败！原因: {data.get('message', '未知错误')}", task=True)
                     notify_manager.add_summary(f"    ❌ 签到: 失败")
         except Exception as e:
-            log_print(f"❌ 签到时发生异常: {e}")
+            log_print(f"❌ 签到时发生异常: {e}", task=True)
             notify_manager.add_summary("    ❌ 签到: 异常")
 
         random_sleep()
@@ -993,14 +1036,15 @@ class ActivityHandler:
                         log_print(f"💰 累计签到奖励领取成功！获得：{award_name}")
                         notify_manager.add_summary(f"    💰 累计奖励: {award_name}")
                     else:
-                        log_print(f"❌ 累计签到奖励领取失败: {draw_res.get('message')}")
+                        log_print(f"❌ 累计签到奖励领取失败: {draw_res.get('message')}", task=True)
                     random_sleep()
                     break
         except Exception as e:
-            log_print(f"❌ 处理累计签到奖励时出错: {e}")
+            log_print(f"❌ 处理累计签到奖励时出错: {e}", task=True)
 
     def _handle_sign_in_with_credits(self, signin_id, creditsAddActionId, business):
         """处理带 creditsAddActionId 和 business 字段的特殊签到。"""
+        failure_manager.begin_task()
         try:
             detail_res = self.client.get(f"{BASE_URL_HD}/api/cn/oapi/marketing/cumulativeSignIn/getSignInDetail?activityId={signin_id}").json()
             if detail_res.get('data', {}).get('todaySignIn'):
@@ -1015,10 +1059,10 @@ class ActivityHandler:
                     log_print(f"✅  签到成功！获得积分：{award_val}")
                     notify_manager.add_summary(f"    ✅  签到: 成功 (积分 +{award_val})")
                 else:
-                    log_print(f"❌  签到失败！原因: {data.get('message', '未知错误')}")
+                    log_print(f"❌  签到失败！原因: {data.get('message', '未知错误')}", task=True)
                     notify_manager.add_summary(f"    ❌  签到: 失败")
         except Exception as e:
-            log_print(f"❌  签到时发生异常: {e}")
+            log_print(f"❌  签到时发生异常: {e}", task=True)
             notify_manager.add_summary("    ❌  签到: 异常")
         random_sleep()
 
@@ -1274,6 +1318,7 @@ class ActivityHandler:
                         continue
 
                 log_print(f"--- ▶️ 开始做任务:【{task_name}】 ---")
+                failure_manager.begin_task()
 
                 try:
                     if task_status == 1:
@@ -1385,12 +1430,12 @@ class ActivityHandler:
                                         if data.get('reserveSuccess') or data.get('alreadyReserveSuccess'):
                                             log_print(f"🎉 预约成功或已预约")
                                         else:
-                                            log_print(f"❌ 预约状态异常: {data}")
+                                            log_print(f"❌ 预约状态异常: {data}", task=True)
                                     else:
-                                        log_print(f"❌ 备用预约方法也失败: {response_data.get('message', '未知错误')}")
+                                        log_print(f"❌ 备用预约方法也失败: {response_data.get('message', '未知错误')}", task=True)
 
                                 except Exception as e:
-                                    log_print(f"❌ 备用预约方法也出错: {e}")
+                                    log_print(f"❌ 备用预约方法也出错: {e}", task=True)
                                     # 即使都失败也继续尝试领取奖励
                         elif task_type in [6, 14]:
                             # 这些类型在状态1时已经被上面过滤，不应该到这里
@@ -1416,15 +1461,16 @@ class ActivityHandler:
                         log_print(f"💰 任务【{task_name}】奖励领取成功！")
                         completed_count += 1
                     else:
-                        log_print(f"❌ 任务【{task_name}】奖励领取失败: {reward_res.get('message')}")
+                        log_print(f"❌ 任务【{task_name}】奖励领取失败: {reward_res.get('message')}", task=True)
                         error_count += 1
                     random_sleep()
                 except Exception as e:
                     error_count += 1
-                    log_print(f"❌ 执行任务【{task_name}】内部出错: {e}")
+                    log_print(f"❌ 执行任务【{task_name}】内部出错: {e}", task=True)
 
         except Exception as e:
-            log_print(f"❌ 处理任务列表时出错: {e}")
+            failure_manager.begin_task()
+            log_print(f"❌ 处理任务列表时出错: {e}", task=True)
             notify_manager.add_summary("    ❌ 任务: 获取列表异常")
 
         if completed_count > 0:
@@ -1708,7 +1754,7 @@ class ActivityHandler:
             log_print("⏭️ 抽奖功能已关闭，跳过抽奖。")
             return
 
-
+        failure_manager.begin_task()
 
         try:
             count_res = self.client.get(f"{BASE_URL_HD}/api/cn/oapi/marketing/raffle/queryRaffleCount?activityId={raffle_id}").json()
@@ -1738,7 +1784,7 @@ class ActivityHandler:
                     if '谢谢' not in award_name and '空气' not in award_name and '再接再厉' not in award_name:
                          winnings.append(award_name)
                 else:
-                    log_print(f"❌ 抽奖失败: {draw_res.get('message')}")
+                    log_print(f"❌ 抽奖失败: {draw_res.get('message')}", task=True)
                 random_sleep(2, 4)
 
             # 添加抽奖摘要
@@ -1748,7 +1794,7 @@ class ActivityHandler:
                 notify_manager.add_summary(f"    🎉 抽奖 ({draw_count}次): 获得[{'、'.join(winnings)}]")
 
         except Exception as e:
-            log_print(f"❌ 抽奖过程中出错: {e}")
+            log_print(f"❌ 抽奖过程中出错: {e}", task=True)
             notify_manager.add_summary("    ❌ 抽奖: 执行异常")
 
     def process_all_activities(self):
@@ -1766,7 +1812,8 @@ class ActivityHandler:
             ids = self._get_activity_ids(bp_url) if bp_url else None
 
             if not ids:
-                log_print(f"❌ 未能获取【{activity['name']}】的活动ID，跳过此活动。")
+                failure_manager.begin_task()
+                log_print(f"❌ 未能获取【{activity['name']}】的活动ID，跳过此活动。", task=True)
                 notify_manager.add_summary("    ❌ ID获取失败，已跳过")
                 continue
 
@@ -1852,7 +1899,10 @@ def main():
     date_str = datetime.now().strftime('%m-%d')
 
     if exit_code == 0:
-        log_print("✅ 任务执行完成，全部成功。", fail=False)
+        if failure_manager.has_failure():
+            log_print("⚠️ 有任务项失败但未过半，本次按成功处理（退出码 0，不推送告警）。明细见上方汇总。", fail=False)
+        else:
+            log_print("✅ 任务执行完成，全部成功。", fail=False)
         # 成功也推送（默认关闭，设 OPPO_NOTIFY_ON_SUCCESS=true 打开）
         if os.environ.get("OPPO_NOTIFY_ON_SUCCESS", "").strip().lower() in ("1", "true", "yes"):
             ok, info = push_qinglong_notify(f"✅ OPPO商城任务完成 - {date_str}",
