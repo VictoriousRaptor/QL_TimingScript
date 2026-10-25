@@ -512,6 +512,15 @@ class OppoApp:
                     self.sign_in_map[self.level] = dsl_json['byId'][signin_field]['attr']['activityInfo']['activityId']
                     break
 
+            # 回退：OPPO 已把分等级签到合并成统一活动（活动名不再带会员等级，
+            # 如「10月积分商城签到」）。等级匹配失败时，若页面只有唯一一个 SignIn
+            # 组件则直接使用它；仍有多个则保持报错，避免像按索引取那样签错等级。
+            if not self.sign_in_map and len(signin_fields) == 1:
+                only = dsl_json['byId'][signin_fields[0]]['attr']['activityInfo']
+                self.sign_in_map[self.level] = only.get('activityId')
+                log_print(f"ℹ️ 签到活动名不含会员等级（'{only.get('activityName', '')}'），"
+                          f"已回退使用页面上唯一的签到活动。")
+
             if not self.sign_in_map:
                 log_print(f"❌ 未找到与会员等级'{self.level}'匹配的签到活动ID。", task=True)
 
