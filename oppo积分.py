@@ -27,18 +27,18 @@ OPPO 商城 APP 和 小程序 签到任务自动化脚本。
 - 任何接口失败（HTTP 错误、业务 code 非 200、返回内容不是合法 JSON）都会明确报错，
  不再静默跳过；
 - Cookie 过期/无效、账号配置格式错误、会员等级非法记为「致命失败」，该账号立即中止；
-- 签到/任务/领奖/抽奖等任务项失败只记录报错，不计为致命：任务项失败过半
- （失败数 * 2 >= 尝试数）才按致命处理；少于一半则退出码 0、不推送告警，
+- 签到/任务/领奖/抽奖等任务项失败只记录报错，不计为致命，
  失败明细仍打印在日志和 stderr 汇总里；
-- 存在致命失败或任务项失败过半时，以退出码 1 结束（青龙等平台会把本次任务标记为失败）。
+- 存在致命失败时，以退出码 1 结束（青龙等平台会把本次任务标记为失败）；
+- （原「任务项失败过半才按致命处理」的逻辑已注释掉，只看致命失败。）
 
-青龙推送（失败告警）：
-- 有失败时调用青龙面板 API 推送通知，走面板里已配置的通知渠道 / Webhook；
+青龙推送（每次运行都推）：
+- 每次运行结束调用青龙面板 API 推送报告（成功/失败都推），走面板里已配置的通知渠道 / Webhook；
 - 推荐 OpenAPI 应用：设 QL_CLIENT_ID + QL_CLIENT_SECRET（面板「应用管理」新建，
   勾选 system 权限）；也支持面板登录 token：QL_TOKEN 或自动读 QL_DIR/config/auth.json；
 - 面板地址默认 http://127.0.0.1:5700，可用 QL_URL 覆盖；
 - 注意青龙的通知接口是 PUT /api/system/notify（POST 会 404）；
-- 成功也推送：设 OPPO_NOTIFY_ON_SUCCESS=true（默认只在失败时推）。
+- 每次运行结束都推送（成功/失败都推）；原 OPPO_NOTIFY_ON_SUCCESS 开关已注释掉。
 """
 import random
 import re
@@ -130,9 +130,9 @@ class FailureManager:
     - 致命失败：Cookie 失效、账号配置错误等，该账号后续流程中止。
 
     退出码 / 告警规则：
-    - 存在致命失败（Cookie/403/配置错误）→ 退出码 1，推送告警；
-    - 任务项失败过半（失败数 * 2 >= 尝试数）→ 视为致命，退出码 1，推送告警；
-    - 少于一半任务失败 → 退出码 0，不推送，只在日志和 stderr 汇总中报错。
+    - 存在致命失败（Cookie/403/配置错误）→ 退出码 1；
+    - 任务项失败只记录，不影响退出码（原「失败过半按致命处理」已注释掉）；
+    - 推送与失败率无关：每次运行结束都推送报告。
     """
 
     def __init__(self):
@@ -187,23 +187,26 @@ class FailureManager:
         lines = [f"共 {total} 项失败（致命 {len(self.fatal_failures)} 项）"]
         if self.task_total:
             ratio = f"{self.task_failed}/{self.task_total}"
-            lines.append(f"任务失败率: {ratio}" + ("（已过半）" if self.task_majority_failed() else "（未过半，仅记录不告警）"))
+            lines.append(f"任务失败率: {ratio}")
         for i, item in enumerate(self.fatal_failures + self.failures, 1):
             lines.append(f"{i}. {item}")
         if self.fatal_failures:
             lines.append("⚠️ 存在致命失败（多为 Cookie 过期或配置错误），请先处理后重跑。")
-        elif self.task_majority_failed():
-            lines.append("⚠️ 任务失败已过半，本次按致命失败处理。")
+        # elif self.task_majority_failed():
+        #     lines.append("⚠️ 任务失败已过半，本次按致命失败处理。")
         return "\n".join(lines)
 
     def report(self):
-        """打印失败汇总（输出到 stderr）。退出码：致命失败或任务失败过半 → 1，否则 0。"""
+        """打印失败汇总（输出到 stderr）。退出码：只有致命失败 → 1，否则 0。"""
         if not self.has_failure():
             return 0
         body = self.summary_text()
         print("\n=============== ❌ 执行失败汇总 ===============\n"
               + body + "\n=============================================", file=sys.stderr)
-        if self.fatal_failures or self.task_majority_failed():
+        # 原「失败过半也按致命处理」已注释掉，只看致命失败
+        # if self.fatal_failures or self.task_majority_failed():
+        #     return 1
+        if self.fatal_failures:
             return 1
         return 0
 
@@ -1909,14 +1912,14 @@ def main():
 
     if exit_code == 0:
         if failure_manager.has_failure():
-            log_print("⚠️ 有任务项失败但未过半，本次按成功处理（退出码 0，不推送告警）。明细见上方汇总。", fail=False)
+            log_print("⚠️ 有任务项失败但未达致命，本次按成功处理（退出码 0）。明细见上方汇总。", fail=False)
         else:
             log_print("✅ 任务执行完成，全部成功。", fail=False)
-        # 成功也推送（默认关闭，设 OPPO_NOTIFY_ON_SUCCESS=true 打开）
-        if os.environ.get("OPPO_NOTIFY_ON_SUCCESS", "").strip().lower() in ("1", "true", "yes"):
-            ok, info = push_qinglong_notify(f"✅ OPPO商城任务完成 - {date_str}",
-                                            notify_manager.get_summary())
-            log_print(f"📢 青龙通知: {info}", fail=False)
+        # 默认推送（原 OPPO_NOTIFY_ON_SUCCESS 开关已注释掉，成功也推）
+        # if os.environ.get("OPPO_NOTIFY_ON_SUCCESS", "").strip().lower() in ("1", "true", "yes"):
+        ok, info = push_qinglong_notify(f"✅ OPPO商城任务完成 - {date_str}",
+                                        notify_manager.get_summary())
+        log_print(f"📢 青龙通知: {info}", fail=False)
     else:
         # 报错时调用青龙 API 推送（走面板里配置的通知渠道 / Webhook）
         body = failure_manager.summary_text()
