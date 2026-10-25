@@ -611,7 +611,9 @@ class OppoApp:
                     continue
 
                 # 跳过不支持的任务类型
-                if task_type == 6:
+                # 6=购买商品；18=点赞类（如"点赞5个帖子"）：完成上报成功但领奖必报
+                # "该任务未完成或者已经领取"，属纯误报，跳过不再空跑
+                if task_type in (6, 18):
                     log_print(f"--- ▶️ 开始做APP任务:【{task_name}】 ---")
                     log_print(f"⏭️ 暂不支持任务类型 {task_type}，跳过。")
                     continue
