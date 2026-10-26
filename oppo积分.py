@@ -259,6 +259,12 @@ def push_qinglong_notify(title, content):
     面板路由定义见 qinglong/back/api/system.ts 的 route.put('/notify')。
     OpenAPI 应用走 PUT /open/system/notify（应用需勾选 system 权限）。
 
+    下游投递（青龙 webhook → Hermes → Telegram）会间歇性抖动，且青龙对通知
+    失败返回的是 HTTP 200 + body code 400，单次失败就放弃会整条告警丢失
+    （2026-10-26 12:37 实测：Hermes 侧 send_path_degraded 返 502，告警未达）。
+    因此失败时每 30s 重试一次，最多重试 10 次（首次 + 10 次 = 最多 11 次
+    请求，最长约 5.5 分钟），覆盖这种几分钟的断连窗口。
+
     :return: (是否成功, 说明)
     """
     base, token, prefix = _qinglong_credentials()
@@ -266,7 +272,8 @@ def push_qinglong_notify(title, content):
         return False, "未找到青龙凭据（QL_CLIENT_ID/SECRET、QL_TOKEN 或 QL_DIR/config/auth.json）"
     if len(content) > 3500:
         content = content[:3400] + "\n...(已截断，完整日志见青龙任务日志)"
-    try:
+
+    def _once():
         with httpx.Client(trust_env=False, timeout=20) as c:
             r = c.put(f"{base}{prefix}/system/notify",
                       json={"title": title, "content": content},
@@ -279,8 +286,23 @@ def push_qinglong_notify(title, content):
                 return True, "推送成功"
             msg = (data or {}).get("message") if isinstance(data, dict) else str(data)[:120]
             return False, f"HTTP {r.status_code} {str(msg)[:120]}"
-    except Exception as e:
-        return False, str(e)[:120]
+
+    max_retry, interval = 10, 30
+    last_info = ""
+    for i in range(max_retry + 1):
+        if i:
+            time.sleep(interval)
+        try:
+            ok, info = _once()
+        except Exception as e:
+            ok, info = False, str(e)[:120]
+        if ok:
+            return True, "推送成功" if i == 0 else f"推送成功（第 {i + 1} 次尝试）"
+        last_info = info
+        if i < max_retry:
+            log_print(f"⚠️ 青龙通知推送失败（{info}），{interval}s 后重试（第 {i + 2}/{max_retry + 1} 次）",
+                      fail=False)
+    return False, f"{last_info}（已重试 {max_retry} 次、间隔 {interval}s，均失败）"
 
 
 class StrictClient(httpx.Client):
